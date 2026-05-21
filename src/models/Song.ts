@@ -10,6 +10,7 @@ export interface ISong extends Document {
   duration: string;
   mood: string;             // Added for AI classification
   moodScore: number;        // Added for AI confidence
+  playCount: number;
   createdAt: Date;
 }
 
