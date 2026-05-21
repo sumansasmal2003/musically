@@ -9,6 +9,7 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@google/genai": "^2.5.0",
     "firebase": "^12.13.0",
     "hls.js": "^1.6.16",
     "mongoose": "^9.6.2",
