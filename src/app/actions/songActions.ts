@@ -1,61 +1,133 @@
-// src/app/actions/songActions.ts
 "use server";
 
 import connectToDatabase from "@/lib/mongodb";
 import Song from "@/models/Song";
+import { GoogleGenAI, Type } from "@google/genai";
 
-// 1. New function to preview the mood before saving
+// Initialize Gemini (Ensure GEMINI_API_KEY is in your .env.local)
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+const MUSIC_MOODS = ["Energetic", "Calm", "Happy", "Sad", "Focus", "Romantic", "Soulful", "Upbeat"];
+
+/**
+ * Helper function to fetch lyrics safely from LRCLIB
+ */
+async function fetchLyrics(title: string, artist: string): Promise<string> {
+  if (!title || !artist) return "";
+  try {
+    const res = await fetch(`https://lrclib.net/api/get?track_name=${encodeURIComponent(title)}&artist_name=${encodeURIComponent(artist)}`, {
+      signal: AbortSignal.timeout(5000) // 5 second timeout so uploads don't freeze
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return data.plainLyrics || "";
+    }
+  } catch (error) {
+    console.error("Lyrics fetch failed:", error);
+  }
+  return "";
+}
+
+/**
+ * 1. AI Analysis Action
+ * Called when the user clicks "Fetch" on the upload page
+ */
 export async function analyzeSongMood(title: string, artist: string) {
   try {
-    const aiResponse = await fetch(`${process.env.HUGGINGFACE_API_URL}/analyze-mood`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        title: title,
-        artist: artist,
-        lyrics_or_description: `${title} by ${artist}`
-      })
+    // 1. Fetch lyrics for context
+    const lyrics = await fetchLyrics(title, artist);
+
+    // 2. Construct the Gemini Prompt
+    const context = lyrics
+      ? `Song: "${title}" by "${artist}"\nLyrics:\n${lyrics}`
+      : `Song: "${title}" by "${artist}"\nNote: Lyrics unavailable. Analyze based on artist genre and song title.`;
+
+    const prompt = `You are an elite music metadata analyst. Analyze the following song and determine its primary mood.
+    You must select EXACTLY ONE mood from this strict list: ${MUSIC_MOODS.join(", ")}.
+
+    ${context}`;
+
+    // 3. Ask Gemini for a strict JSON response
+    const response = await ai.models.generateContent({
+      model: "gemini-3.1-flash-lite",
+      contents: prompt,
+      config: {
+        temperature: 0.2, // Keep it focused and deterministic
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            primary_mood: {
+              type: Type.STRING,
+              description: "The single best mood match from the allowed list.",
+              enum: MUSIC_MOODS
+            },
+            confidence_score: {
+              type: Type.NUMBER,
+              description: "Confidence in the assessment from 0.0 to 1.0"
+            }
+          },
+          required: ["primary_mood", "confidence_score"]
+        }
+      }
     });
 
-    if (aiResponse.ok) {
-      const aiData = await aiResponse.json();
-      return { success: true, mood: aiData.primary_mood, score: aiData.confidence_score };
-    }
-    return { success: false, mood: "Unknown", score: 0 };
+    // 4. Parse the output
+    const resultText = response.text;
+    if (!resultText) throw new Error("No response from Gemini");
+
+    const analysis = JSON.parse(resultText);
+
+    return {
+      mood: analysis.primary_mood,
+      score: analysis.confidence_score
+    };
+
   } catch (error) {
-    console.error("Mood Engine API failed:", error);
-    return { success: false, mood: "Unknown", score: 0 };
+    console.error("Gemini Mood Analysis Error:", error);
+    // Safe Fallback if AI fails or rate limits
+    return {
+      mood: "Upbeat",
+      score: 0.5
+    };
   }
 }
 
-// 2. Updated migration function to accept the pre-computed mood
-export async function migrateSongToMongo(songData: {
-  title: string;
-  artist: string;
-  coverUrl: string;
-  audioUrl: string;
-  duration: string;
-  mood: string;
-  moodScore: number;
-}) {
+/**
+ * 2. MongoDB Migration Action
+ * Called when the user clicks "Confirm & Save to MongoDB"
+ */
+export async function migrateSongToMongo(songData: any) {
   try {
     await connectToDatabase();
 
-    const existing = await Song.findOne({
+    // Check if song already exists to prevent duplicates
+    const existingSong = await Song.findOne({
       title: songData.title,
       artist: songData.artist
     });
 
-    if (existing) {
-      return { success: false, message: "This song already exists in your MongoDB database." };
+    if (existingSong) {
+      return { success: false, message: "This song already exists in the database." };
     }
 
-    const newSong = new Song(songData);
+    // Save the new song with the AI detected mood
+    const newSong = new Song({
+      title: songData.title,
+      artist: songData.artist,
+      coverUrl: songData.coverUrl,
+      audioUrl: songData.audioUrl,
+      duration: songData.duration || "0:00",
+      mood: songData.mood,
+      moodScore: songData.moodScore,
+      playCount: 0 // Initialize tracking
+    });
+
     await newSong.save();
 
-    return { success: true, message: "Song successfully migrated with AI tags!" };
+    return { success: true, message: "Successfully saved to MongoDB!" };
   } catch (error) {
-    console.error("Migration error:", error);
-    return { success: false, message: "Failed to save to MongoDB. Please try again." };
+    console.error("MongoDB Migration Error:", error);
+    return { success: false, message: "Failed to save to database." };
   }
 }
